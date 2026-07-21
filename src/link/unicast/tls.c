@@ -180,7 +180,10 @@ static size_t _z_f_link_read_exact_tls(const _z_link_t *self, uint8_t *ptr, size
         }
 
         if (rb == SIZE_MAX) {
-            n = rb;
+            // Fatal TLS read (peer close / SSL alert / net error, never a would-block):
+            // stop and report the partial count so the handshake reader fails the open
+            // fast. Returning SIZE_MAX would be retried as a timeout until the connect
+            // deadline, busy-looping on the dead connection.
             break;
         }
         n += rb;
