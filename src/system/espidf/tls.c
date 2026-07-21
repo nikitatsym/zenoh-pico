@@ -12,6 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+#include <inttypes.h>
 #include "zenoh-pico/system/link/tls.h"
 
 #if Z_FEATURE_LINK_TLS == 1
@@ -471,7 +472,7 @@ z_result_t _z_open_tls(_z_tls_socket_t *sock, const _z_sys_net_endpoint_t *rep, 
     uint32_t verify_result = mbedtls_ssl_get_verify_result(&sock->_tls_ctx->_ssl);
     if (verify_result != 0) {
         if ((verify_result & ~ignored_flags) != 0u) {
-            _Z_ERROR("TLS client certificate verification failed: 0x%08x", verify_result);
+            _Z_ERROR("TLS client certificate verification failed: 0x%08" PRIX32, verify_result);
             _z_close_tcp(&sock->_sock);
             _z_tls_context_free(&sock->_tls_ctx);
             return _Z_ERR_GENERIC;
@@ -632,7 +633,7 @@ z_result_t _z_tls_accept(_z_sys_net_socket_t *socket, const _z_sys_net_socket_t 
             allowed_flags |= MBEDTLS_X509_BADCERT_SKIP_VERIFY;
         }
         if ((verify_result & ~allowed_flags) != 0u) {
-            _Z_ERROR("TLS client certificate verification failed: 0x%08x", verify_result);
+            _Z_ERROR("TLS client certificate verification failed: 0x%08" PRIX32, verify_result);
             _z_tls_context_free(&tls_sock->_tls_ctx);
             z_free(socket->_tls_sock);
             socket->_tls_sock = NULL;
