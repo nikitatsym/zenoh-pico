@@ -26,6 +26,10 @@
 #include "zenoh-pico/system/common/serial.h"
 #include "zenoh-pico/system/link/bt.h"
 #include "zenoh-pico/system/link/serial.h"
+#if Z_FEATURE_LINK_SERIAL == 1 && Z_FEATURE_LINK_SERIAL_USB == 1
+#include "driver/usb_serial_jtag.h"
+#include "freertos/FreeRTOS.h"
+#endif
 #include "zenoh-pico/system/platform.h"
 #include "zenoh-pico/transport/transport.h"
 #include "zenoh-pico/utils/checksum.h"
@@ -749,6 +753,13 @@ size_t _z_send_udp_multicast(const _z_sys_net_socket_t sock, const uint8_t *ptr,
 
 #if Z_FEATURE_LINK_SERIAL == 1
 /*------------------ Serial sockets ------------------*/
+#if Z_FEATURE_LINK_SERIAL_USB == 1
+// Sentinel stored in _z_sys_net_socket_t._serial to mark the on-chip USB
+// Serial/JTAG controller, which has no UART port number. Chosen outside the
+// valid uart_port_t range (UART_NUM_0..UART_NUM_MAX-1).
+#define _Z_ESPIDF_USB_SERIAL_JTAG_PORT ((uart_port_t)0x7F)
+#endif
+
 z_result_t _z_open_serial_from_pins(_z_sys_net_socket_t *sock, uint32_t txpin, uint32_t rxpin, uint32_t baudrate) {
     z_result_t ret = _Z_RES_OK;
     (void)(sock);
@@ -764,6 +775,22 @@ z_result_t _z_open_serial_from_pins(_z_sys_net_socket_t *sock, uint32_t txpin, u
 }
 
 z_result_t _z_open_serial_from_dev(_z_sys_net_socket_t *sock, char *dev, uint32_t baudrate) {
+#if Z_FEATURE_LINK_SERIAL_USB == 1
+    // USB Serial/JTAG path: dev == "usb". Baudrate is irrelevant for USB-CDC
+    // but is still parsed/required by the serial link config layer.
+    if (strcmp(dev, "usb") == 0) {
+        (void)baudrate;
+        usb_serial_jtag_driver_config_t usb_cfg = {
+            .tx_buffer_size = _Z_SERIAL_MAX_COBS_BUF_SIZE,
+            .rx_buffer_size = _Z_SERIAL_MAX_COBS_BUF_SIZE,
+        };
+        if (usb_serial_jtag_driver_install(&usb_cfg) != ESP_OK) {
+            _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+        }
+        sock->_serial = _Z_ESPIDF_USB_SERIAL_JTAG_PORT;
+        return _z_connect_serial(*sock);
+    }
+#endif
     uint32_t rxpin = 0;
     uint32_t txpin = 0;
     if (strcmp(dev, "UART_0") == 0) {
@@ -831,6 +858,12 @@ z_result_t _z_listen_serial_from_dev(_z_sys_net_socket_t *sock, char *dev, uint3
 }
 
 void _z_close_serial(_z_sys_net_socket_t *sock) {
+#if Z_FEATURE_LINK_SERIAL_USB == 1
+    if (sock->_serial == _Z_ESPIDF_USB_SERIAL_JTAG_PORT) {
+        usb_serial_jtag_driver_uninstall();
+        return;
+    }
+#endif
     uart_wait_tx_done(sock->_serial, 1000);
     uart_flush(sock->_serial);
     uart_driver_delete(sock->_serial);
@@ -844,7 +877,15 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
     }
     size_t rb = 0;
     while (rb < _Z_SERIAL_MAX_COBS_BUF_SIZE) {
-        int r = uart_read_bytes(sock._serial, &raw_buf[rb], 1, 1000);
+        int r;
+#if Z_FEATURE_LINK_SERIAL_USB == 1
+        if (sock._serial == _Z_ESPIDF_USB_SERIAL_JTAG_PORT) {
+            r = usb_serial_jtag_read_bytes(&raw_buf[rb], 1, 1000);
+        } else
+#endif
+        {
+            r = uart_read_bytes(sock._serial, &raw_buf[rb], 1, 1000);
+        }
         if (r == 0) {
             _Z_DEBUG("Timeout reading from serial");
             if (rb == 0) {
@@ -888,7 +929,15 @@ size_t _z_send_serial_internal(const _z_sys_net_socket_t sock, uint8_t header, c
         return ret;
     }
 
-    ssize_t wb = uart_write_bytes(sock._serial, raw_buf, ret);
+    ssize_t wb;
+#if Z_FEATURE_LINK_SERIAL_USB == 1
+    if (sock._serial == _Z_ESPIDF_USB_SERIAL_JTAG_PORT) {
+        wb = usb_serial_jtag_write_bytes(raw_buf, ret, portMAX_DELAY);
+    } else
+#endif
+    {
+        wb = uart_write_bytes(sock._serial, raw_buf, ret);
+    }
     if (wb != (ssize_t)ret) {
         ret = SIZE_MAX;
     }
