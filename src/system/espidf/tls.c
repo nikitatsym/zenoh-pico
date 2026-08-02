@@ -703,6 +703,14 @@ size_t _z_write_all_tls(const _z_tls_socket_t *sock, const uint8_t *ptr, size_t 
         if (wb == SIZE_MAX) {
             return wb;
         }
+        if (wb == 0) {
+            // WANT_READ/WANT_WRITE on a blocking socket means SO_SNDTIMEO expired:
+            // the peer is not draining. Looping on it burns the executor forever,
+            // which is the failure mode this port exists to avoid. No caller uses
+            // _write_all_f on TLS today; a pico bump would revive the loop.
+            _Z_ERROR("TLS write made no progress");
+            return SIZE_MAX;
+        }
         n += wb;
     } while (n < len);
     return n;
