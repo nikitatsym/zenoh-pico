@@ -165,11 +165,30 @@ z_result_t _z_create_endpoint_tcp(_z_sys_net_endpoint_t *ep, const char *s_addre
 
 void _z_free_endpoint_tcp(_z_sys_net_endpoint_t *ep) { freeaddrinfo(ep->_iptcp); }
 
+// A send stalled past this window means a dead path: a blocking send starves the shared executor task.
+#define _Z_ESPIDF_TCP_SEND_TIMEOUT_MS 10000
+
 z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t rep, uint32_t tout) {
     z_result_t ret = _Z_RES_OK;
 
     sock->_fd = socket(rep._iptcp->ai_family, rep._iptcp->ai_socktype, rep._iptcp->ai_protocol);
     if (sock->_fd != -1) {
+        z_time_t tv;
+        // Bounds the read future, which blocks the executor the lease check also runs on.
+        tv.tv_sec = tout / (uint32_t)1000;
+        tv.tv_usec = (tout % (uint32_t)1000) * (uint32_t)1000;
+        if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) < 0)) {
+            _Z_ERROR_LOG(_Z_ERR_GENERIC);
+            ret = _Z_ERR_GENERIC;
+        }
+
+        tv.tv_sec = _Z_ESPIDF_TCP_SEND_TIMEOUT_MS / (uint32_t)1000;
+        tv.tv_usec = (_Z_ESPIDF_TCP_SEND_TIMEOUT_MS % (uint32_t)1000) * (uint32_t)1000;
+        if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv)) < 0)) {
+            _Z_ERROR_LOG(_Z_ERR_GENERIC);
+            ret = _Z_ERR_GENERIC;
+        }
+
         int optflag = 1;
         if ((ret == _Z_RES_OK) &&
             (setsockopt(sock->_fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optflag, sizeof(optflag)) < 0)) {
@@ -758,6 +777,8 @@ size_t _z_send_udp_multicast(const _z_sys_net_socket_t sock, const uint8_t *ptr,
 // Serial/JTAG controller, which has no UART port number. Chosen outside the
 // valid uart_port_t range (UART_NUM_0..UART_NUM_MAX-1).
 #define _Z_ESPIDF_USB_SERIAL_JTAG_PORT ((uart_port_t)0x7F)
+// A write stalled past this window means the USB host stopped draining the CDC endpoint.
+#define _Z_ESPIDF_SERIAL_SEND_TIMEOUT_MS 10000
 #endif
 
 z_result_t _z_open_serial_from_pins(_z_sys_net_socket_t *sock, uint32_t txpin, uint32_t rxpin, uint32_t baudrate) {
@@ -889,6 +910,7 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
         if (r == 0) {
             _Z_DEBUG("Timeout reading from serial");
             if (rb == 0) {
+                z_free(raw_buf);
                 return SIZE_MAX;
             }
         } else if (r == 1) {
@@ -898,6 +920,7 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
             }
         } else {
             _Z_ERROR("Error reading from serial");
+            z_free(raw_buf);
             return SIZE_MAX;
         }
     }
@@ -905,6 +928,7 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
     uint8_t *tmp_buf = (uint8_t *)z_malloc(_Z_SERIAL_MFS_SIZE);
     if (tmp_buf == NULL) {
         _Z_ERROR("Failed to allocate serial MFS buffer");
+        z_free(raw_buf);
         return SIZE_MAX;
     }
     size_t ret = _z_serial_msg_deserialize(raw_buf, rb, ptr, len, header, tmp_buf, _Z_SERIAL_MFS_SIZE);
@@ -932,19 +956,20 @@ size_t _z_send_serial_internal(const _z_sys_net_socket_t sock, uint8_t header, c
     ssize_t wb;
 #if Z_FEATURE_LINK_SERIAL_USB == 1
     if (sock._serial == _Z_ESPIDF_USB_SERIAL_JTAG_PORT) {
-        wb = usb_serial_jtag_write_bytes(raw_buf, ret, portMAX_DELAY);
+        wb = usb_serial_jtag_write_bytes(raw_buf, ret, pdMS_TO_TICKS(_Z_ESPIDF_SERIAL_SEND_TIMEOUT_MS));
     } else
 #endif
     {
         wb = uart_write_bytes(sock._serial, raw_buf, ret);
     }
-    if (wb != (ssize_t)ret) {
-        ret = SIZE_MAX;
-    }
 
     z_free(raw_buf);
     z_free(tmp_buf);
 
+    // A short write leaves a truncated COBS frame on the wire; only SIZE_MAX fails the link.
+    if (wb != (ssize_t)ret) {
+        return SIZE_MAX;
+    }
     return len;
 }
 #endif
