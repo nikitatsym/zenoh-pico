@@ -206,7 +206,8 @@ z_result_t _z_mutex_rec_unlock(_z_mutex_rec_t *m) { _Z_CHECK_SYS_ERR(pthread_mut
 z_result_t _z_condvar_init(_z_condvar_t *cv) {
     pthread_condattr_t attr;
     pthread_condattr_init(&attr);
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    // No setclock here: IDF always compares the deadline against gettimeofday, so the clock
+    // attribute would only hide the rebasing _z_condvar_wait_until has to do.
     _Z_CHECK_SYS_ERR(pthread_cond_init(cv, &attr));
 }
 
@@ -219,7 +220,25 @@ z_result_t _z_condvar_signal_all(_z_condvar_t *cv) { _Z_CHECK_SYS_ERR(pthread_co
 z_result_t _z_condvar_wait(_z_condvar_t *cv, _z_mutex_t *m) { _Z_CHECK_SYS_ERR(pthread_cond_wait(cv, m)); }
 
 z_result_t _z_condvar_wait_until(_z_condvar_t *cv, _z_mutex_t *m, const z_clock_t *abstime) {
-    int error = pthread_cond_timedwait(cv, m, abstime);
+    // abstime is monotonic but IDF compares it against gettimeofday, so it has to be rebased:
+    // once SNTP steps the wall clock a raw monotonic deadline expires instantly, every time.
+    z_clock_t now = z_clock_now();
+    int64_t delta_ns = (((int64_t)abstime->tv_sec - (int64_t)now.tv_sec) * INT64_C(1000000000)) +
+                       ((int64_t)abstime->tv_nsec - (int64_t)now.tv_nsec);
+    if (delta_ns < 0) {
+        delta_ns = 0;
+    }
+
+    z_time_t real_now = z_time_now();
+    struct timespec target;
+    target.tv_sec = real_now.tv_sec + (time_t)(delta_ns / INT64_C(1000000000));
+    target.tv_nsec = (long)(real_now.tv_usec * 1000) + (long)(delta_ns % INT64_C(1000000000));
+    if (target.tv_nsec >= 1000000000) {
+        target.tv_sec += 1;
+        target.tv_nsec -= 1000000000;
+    }
+
+    int error = pthread_cond_timedwait(cv, m, &target);
 
     if (error == ETIMEDOUT) {
         return Z_ETIMEDOUT;

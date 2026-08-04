@@ -925,9 +925,11 @@ void _z_close_serial(_z_sys_net_socket_t *sock) {
     uart_driver_delete(sock->_serial);
 }
 
-// Each byte read below waits up to 1000 ticks (10 s at the default 100 Hz), so the budget
-// must clear a few of those to survive a host that is merely busy mid-frame; a frame that
-// has not completed within it belongs to a host that is gone.
+// A byte read parks the shared executor task, so it must stay far below the transport lease;
+// an idle line just ends the read and the rx future retries on the next spin.
+#define _Z_ESPIDF_SERIAL_BYTE_TIMEOUT_MS 100
+// Mid-frame the per-byte timeout only stalls progress instead of ending the read, so a frame
+// that has not completed within this budget belongs to a host that is gone.
 #define _Z_ESPIDF_SERIAL_FRAME_TIMEOUT_MS 30000
 
 size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, uint8_t *ptr, size_t len) {
@@ -942,11 +944,11 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
         int r;
 #if Z_FEATURE_LINK_SERIAL_USB == 1
         if (sock._serial == _Z_ESPIDF_USB_SERIAL_JTAG_PORT) {
-            r = usb_serial_jtag_read_bytes(&raw_buf[rb], 1, 1000);
+            r = usb_serial_jtag_read_bytes(&raw_buf[rb], 1, pdMS_TO_TICKS(_Z_ESPIDF_SERIAL_BYTE_TIMEOUT_MS));
         } else
 #endif
         {
-            r = uart_read_bytes(sock._serial, &raw_buf[rb], 1, 1000);
+            r = uart_read_bytes(sock._serial, &raw_buf[rb], 1, pdMS_TO_TICKS(_Z_ESPIDF_SERIAL_BYTE_TIMEOUT_MS));
         }
         if (r == 0) {
             _Z_DEBUG("Timeout reading from serial");

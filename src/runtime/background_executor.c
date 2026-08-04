@@ -1,5 +1,7 @@
 #include "zenoh-pico/runtime/background_executor.h"
 
+#include "zenoh-pico/utils/logging.h"
+
 #if Z_FEATURE_MULTI_THREAD == 1
 typedef struct _z_background_executor_inner_t {
     _z_executor_t _executor;
@@ -61,21 +63,30 @@ z_result_t _z_background_executor_inner_run_forever(_z_background_executor_inner
                 break;              // stop requested, exit the loop and end the thread
             }
             // if there are waiters, sleep until they are resumed
-            _Z_CLEAN_RETURN_IF_ERR(_z_condvar_wait(&be->_condvar, &be->_mutex), _z_mutex_unlock(&be->_mutex));
+            z_result_t wait_result = _z_condvar_wait(&be->_condvar, &be->_mutex);
+            if (wait_result != _Z_RES_OK) {
+                // Ending the loop here would keep the session open with rx, keepalive and lease dead.
+                _Z_ERROR("Executor condvar wait failed while suspended: %d", wait_result);
+            }
         }
         if (thread_idx < be->_thread_idx) {
             break;  // stop requested, exit the loop and end the thread
         }
         _z_executor_spin_result_t res = _z_executor_spin(&be->_executor);
         if (res.status == _Z_EXECUTOR_SPIN_RESULT_NO_TASKS) {  // no pending tasks, sleep until next task is added
-            _Z_CLEAN_RETURN_IF_ERR(_z_condvar_wait(&be->_condvar, &be->_mutex), _z_mutex_unlock(&be->_mutex));
+            z_result_t wait_result = _z_condvar_wait(&be->_condvar, &be->_mutex);
+            if (wait_result != _Z_RES_OK) {
+                // Ending the loop here would keep the session open with rx, keepalive and lease dead.
+                _Z_ERROR("Executor condvar wait failed: %d", wait_result);
+            }
         } else if (res.status == _Z_EXECUTOR_SPIN_RESULT_SHOULD_WAIT) {  // we have pending timed tasks but they are not
                                                                          // ready yet, sleep until the next one is ready
             z_clock_t now = z_clock_now();
             if (zp_clock_elapsed_ms_since(&res.next_wake_up_time, &now) > 1) {  // sleep until next task is ready
                 z_result_t wait_result = _z_condvar_wait_until(&be->_condvar, &be->_mutex, &res.next_wake_up_time);
                 if (wait_result != Z_ETIMEDOUT && wait_result != _Z_RES_OK) {
-                    return _z_mutex_unlock(&be->_mutex);
+                    // The next spin re-reads the deadline, so retrying is safer than ending the loop.
+                    _Z_ERROR("Executor timed condvar wait failed: %d", wait_result);
                 }
             }
         }
@@ -149,7 +160,13 @@ void *_z_background_executor_inner_task_fn(void *arg) {
     size_t thread_idx = be->_thread_idx;  // this is safe since _z_background_executor_inner_start holds the mutex until
                                           // be->_started is set to true.
     _z_atomic_bool_store(&be->_started, true, _z_memory_order_release);
-    _z_background_executor_inner_run_forever(be, thread_idx);
+    z_result_t ret = _z_background_executor_inner_run_forever(be, thread_idx);
+    if (ret != _Z_RES_OK) {
+        // A stop clears _started itself before joining, so only an unrequested exit lands here:
+        // clear it so the outside sees a dead executor instead of an open but deaf session.
+        _Z_ERROR("Executor thread died: %d", ret);
+        _z_atomic_bool_store(&be->_started, false, _z_memory_order_release);
+    }
     return NULL;
 }
 
