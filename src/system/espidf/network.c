@@ -12,6 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdbool.h>
@@ -168,72 +169,106 @@ void _z_free_endpoint_tcp(_z_sys_net_endpoint_t *ep) { freeaddrinfo(ep->_iptcp);
 // A send stalled past this window means a dead path: a blocking send starves the shared executor task.
 #define _Z_ESPIDF_TCP_SEND_TIMEOUT_MS 10000
 
-z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t rep, uint32_t tout) {
-    z_result_t ret = _Z_RES_OK;
+// tout is the per-read socket timeout (100 ms by default), which is far below a WAN
+// handshake over a phone hotspot, so the connect deadline needs a floor of its own.
+#define _Z_ESPIDF_TCP_CONNECT_TIMEOUT_MS 10000
 
-    sock->_fd = socket(rep._iptcp->ai_family, rep._iptcp->ai_socktype, rep._iptcp->ai_protocol);
-    if (sock->_fd != -1) {
-        z_time_t tv;
-        // Bounds the read future, which blocks the executor the lease check also runs on.
-        tv.tv_sec = tout / (uint32_t)1000;
-        tv.tv_usec = (tout % (uint32_t)1000) * (uint32_t)1000;
-        if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) < 0)) {
-            _Z_ERROR_LOG(_Z_ERR_GENERIC);
-            ret = _Z_ERR_GENERIC;
-        }
+static z_result_t _z_open_tcp_setopts(const _z_sys_net_socket_t *sock, uint32_t tout) {
+    z_time_t tv;
+    // Bounds the read future, which blocks the executor the lease check also runs on.
+    tv.tv_sec = tout / (uint32_t)1000;
+    tv.tv_usec = (tout % (uint32_t)1000) * (uint32_t)1000;
+    if (setsockopt(sock->_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) < 0) {
+        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+    }
 
-        tv.tv_sec = _Z_ESPIDF_TCP_SEND_TIMEOUT_MS / (uint32_t)1000;
-        tv.tv_usec = (_Z_ESPIDF_TCP_SEND_TIMEOUT_MS % (uint32_t)1000) * (uint32_t)1000;
-        if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv)) < 0)) {
-            _Z_ERROR_LOG(_Z_ERR_GENERIC);
-            ret = _Z_ERR_GENERIC;
-        }
+    tv.tv_sec = _Z_ESPIDF_TCP_SEND_TIMEOUT_MS / (uint32_t)1000;
+    tv.tv_usec = (_Z_ESPIDF_TCP_SEND_TIMEOUT_MS % (uint32_t)1000) * (uint32_t)1000;
+    if (setsockopt(sock->_fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv)) < 0) {
+        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+    }
 
-        int optflag = 1;
-        if ((ret == _Z_RES_OK) &&
-            (setsockopt(sock->_fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optflag, sizeof(optflag)) < 0)) {
-            _Z_ERROR_LOG(_Z_ERR_GENERIC);
-            ret = _Z_ERR_GENERIC;
-        }
+    int optflag = 1;
+    if (setsockopt(sock->_fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optflag, sizeof(optflag)) < 0) {
+        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+    }
 
 #if Z_FEATURE_TCP_NODELAY == 1
-        if ((ret == _Z_RES_OK) &&
-            (setsockopt(sock->_fd, IPPROTO_TCP, TCP_NODELAY, (void *)&optflag, sizeof(optflag)) < 0)) {
-            _Z_ERROR_LOG(_Z_ERR_GENERIC);
-            ret = _Z_ERR_GENERIC;
-        }
+    if (setsockopt(sock->_fd, IPPROTO_TCP, TCP_NODELAY, (void *)&optflag, sizeof(optflag)) < 0) {
+        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+    }
 #endif
 
 #if LWIP_SO_LINGER == 1
-        struct linger ling;
-        ling.l_onoff = 1;
-        ling.l_linger = Z_TRANSPORT_LEASE / 1000;
-        if ((ret == _Z_RES_OK) &&
-            (setsockopt(sock->_fd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(struct linger)) < 0)) {
-            _Z_ERROR_LOG(_Z_ERR_GENERIC);
-            ret = _Z_ERR_GENERIC;
-        }
+    struct linger ling;
+    ling.l_onoff = 1;
+    ling.l_linger = Z_TRANSPORT_LEASE / 1000;
+    if (setsockopt(sock->_fd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(struct linger)) < 0) {
+        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+    }
 #endif
 
-        for (struct addrinfo *it = rep._iptcp; it != NULL; it = it->ai_next) {
-            if ((ret == _Z_RES_OK) && (connect(sock->_fd, it->ai_addr, it->ai_addrlen) < 0)) {
-                if (it->ai_next == NULL) {
-                    _Z_ERROR_LOG(_Z_ERR_GENERIC);
-                    ret = _Z_ERR_GENERIC;
-                    break;
-                }
-            } else {
-                break;
+    return _Z_RES_OK;
+}
+
+static z_result_t _z_connect_tcp_deadline(const _z_sys_net_socket_t *sock, const struct addrinfo *it, uint32_t tout) {
+    _Z_RETURN_IF_ERR(_z_socket_set_blocking(sock, false));
+
+    z_result_t ret = _Z_RES_OK;
+    if (connect(sock->_fd, it->ai_addr, it->ai_addrlen) < 0) {
+        if (errno != EINPROGRESS) {
+            ret = _Z_ERR_GENERIC;
+        } else {
+            fd_set write_fds;
+            FD_ZERO(&write_fds);
+            FD_SET(sock->_fd, &write_fds);
+            struct timeval deadline;
+            deadline.tv_sec = tout / (uint32_t)1000;
+            deadline.tv_usec = (tout % (uint32_t)1000) * (uint32_t)1000;
+            int so_error = 0;
+            socklen_t optlen = sizeof(so_error);
+            if (select(sock->_fd + 1, NULL, &write_fds, NULL, &deadline) <= 0) {
+                ret = _Z_ERR_GENERIC;
+            } else if ((getsockopt(sock->_fd, SOL_SOCKET, SO_ERROR, (void *)&so_error, &optlen) < 0) ||
+                       (so_error != 0)) {
+                ret = _Z_ERR_GENERIC;
             }
         }
+    }
 
-        if (ret != _Z_RES_OK) {
-            close(sock->_fd);
-            sock->_fd = -1;
+    if (ret == _Z_RES_OK) {
+        // Every read/write path assumes blocking semantics bounded by SO_RCVTIMEO/SO_SNDTIMEO.
+        ret = _z_socket_set_blocking(sock, true);
+    }
+    return ret;
+}
+
+z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t rep, uint32_t tout) {
+    uint32_t connect_tout = (tout > _Z_ESPIDF_TCP_CONNECT_TIMEOUT_MS) ? tout : _Z_ESPIDF_TCP_CONNECT_TIMEOUT_MS;
+    z_result_t ret = _Z_ERR_GENERIC;
+    sock->_fd = -1;
+
+    // One socket per entry: a socket carries the family of the entry it was created from,
+    // and a failed connect leaves it unusable, so sharing one would void the IPv6/IPv4
+    // fallback that getaddrinfo returns.
+    for (struct addrinfo *it = rep._iptcp; it != NULL; it = it->ai_next) {
+        sock->_fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (sock->_fd == -1) {
+            continue;
         }
-    } else {
-        _Z_ERROR_LOG(_Z_ERR_GENERIC);
-        ret = _Z_ERR_GENERIC;
+        ret = _z_open_tcp_setopts(sock, tout);
+        if (ret == _Z_RES_OK) {
+            ret = _z_connect_tcp_deadline(sock, it, connect_tout);
+        }
+        if (ret == _Z_RES_OK) {
+            break;
+        }
+        close(sock->_fd);
+        sock->_fd = -1;
+    }
+
+    if (ret != _Z_RES_OK) {
+        _Z_ERROR_LOG(ret);
     }
 
     return ret;
@@ -890,6 +925,11 @@ void _z_close_serial(_z_sys_net_socket_t *sock) {
     uart_driver_delete(sock->_serial);
 }
 
+// Each byte read below waits up to 1000 ticks (10 s at the default 100 Hz), so the budget
+// must clear a few of those to survive a host that is merely busy mid-frame; a frame that
+// has not completed within it belongs to a host that is gone.
+#define _Z_ESPIDF_SERIAL_FRAME_TIMEOUT_MS 30000
+
 size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, uint8_t *ptr, size_t len) {
     uint8_t *raw_buf = (uint8_t *)z_malloc(_Z_SERIAL_MAX_COBS_BUF_SIZE);
     if (raw_buf == NULL) {
@@ -897,6 +937,7 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
         return SIZE_MAX;
     }
     size_t rb = 0;
+    z_clock_t frame_start = z_clock_now();
     while (rb < _Z_SERIAL_MAX_COBS_BUF_SIZE) {
         int r;
 #if Z_FEATURE_LINK_SERIAL_USB == 1
@@ -913,7 +954,17 @@ size_t _z_read_serial_internal(const _z_sys_net_socket_t sock, uint8_t *header, 
                 z_free(raw_buf);
                 return SIZE_MAX;
             }
+            // Only the first byte is covered by the single-timeout exit above; without a
+            // budget a host that disconnects mid-frame keeps the read task here forever.
+            if (z_clock_elapsed_ms(&frame_start) > _Z_ESPIDF_SERIAL_FRAME_TIMEOUT_MS) {
+                _Z_ERROR("Incomplete serial frame after %d ms", _Z_ESPIDF_SERIAL_FRAME_TIMEOUT_MS);
+                z_free(raw_buf);
+                return SIZE_MAX;
+            }
         } else if (r == 1) {
+            if (rb == 0) {
+                frame_start = z_clock_now();
+            }
             rb = rb + (size_t)1;
             if (raw_buf[rb - 1] == (uint8_t)0x00) {
                 break;

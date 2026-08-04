@@ -60,9 +60,15 @@ typedef struct {
 
 static void z_task_wrapper(void *arg) {
     z_task_arg *targ = (z_task_arg *)arg;
+    EventGroupHandle_t join_event = targ->join_event;
     targ->fun(targ->arg);
-    xEventGroupSetBits(targ->join_event, 1);
-    vTaskDelete(NULL);
+    // The wrapper owns its argument block; the joiner only ever touches join_event.
+    z_free(targ);
+    xEventGroupSetBits(join_event, 1);
+    // xEventGroupSetBits still reads the group after it unblocks the joiner, so parking
+    // here lets the joiner observe that this task is done with join_event before it
+    // deletes it. Self-deleting would leave that read racing the delete.
+    vTaskSuspend(NULL);
 }
 
 static z_task_attr_t z_default_task_attr = {
@@ -77,6 +83,13 @@ static z_task_attr_t z_default_task_attr = {
 };
 
 /*------------------ Thread ------------------*/
+// The wrapper never ran, so nothing else can own these yet.
+static void z_task_init_rollback(_z_task_t *task, z_task_arg *z_arg) {
+    vEventGroupDelete(task->join_event);
+    task->join_event = NULL;
+    z_free(z_arg);
+}
+
 z_result_t _z_task_init(_z_task_t *task, z_task_attr_t *arg_attr, void *(*fun)(void *), void *arg) {
     z_task_attr_t *attr = arg_attr;
     z_task_arg *z_arg = (z_task_arg *)z_malloc(sizeof(z_task_arg));
@@ -86,7 +99,12 @@ z_result_t _z_task_init(_z_task_t *task, z_task_attr_t *arg_attr, void *(*fun)(v
 
     z_arg->fun = fun;
     z_arg->arg = arg;
+    task->handle = NULL;
     task->join_event = xEventGroupCreate();
+    if (task->join_event == NULL) {
+        z_free(z_arg);
+        return -1;
+    }
     z_arg->join_event = task->join_event;
 
     if (attr == NULL) {
@@ -98,12 +116,14 @@ z_result_t _z_task_init(_z_task_t *task, z_task_attr_t *arg_attr, void *(*fun)(v
         task->handle = xTaskCreateStatic(z_task_wrapper, attr->name, attr->stack_depth, z_arg, attr->priority,
                                          attr->stack_buffer, attr->task_buffer);
         if (task->handle == NULL) {
+            z_task_init_rollback(task, z_arg);
             return -1;
         }
     } else {
 #endif /* SUPPORT_STATIC_ALLOCATION */
         if (xTaskCreate(z_task_wrapper, attr->name, attr->stack_depth, z_arg, attr->priority, &task->handle) !=
             pdPASS) {
+            z_task_init_rollback(task, z_arg);
             return -1;
         }
 #if (configSUPPORT_STATIC_ALLOCATION == 1)
@@ -115,6 +135,16 @@ z_result_t _z_task_init(_z_task_t *task, z_task_attr_t *arg_attr, void *(*fun)(v
 
 z_result_t _z_task_join(_z_task_t *task) {
     xEventGroupWaitBits(task->join_event, 1, pdFALSE, pdFALSE, portMAX_DELAY);
+    // The wrapper parks itself right after signalling; waiting for that state is what
+    // makes reclaiming the event group safe on both cores. It is straight-line code
+    // after the signal, so this settles within a tick or two.
+    while (eTaskGetState(task->handle) != eSuspended) {
+        vTaskDelay(1);
+    }
+    vTaskDelete(task->handle);
+    task->handle = NULL;
+    vEventGroupDelete(task->join_event);
+    task->join_event = NULL;
     return 0;
 }
 
@@ -132,7 +162,11 @@ void _z_task_exit(void) { vTaskDelete(NULL); }
 
 void _z_task_free(_z_task_t **task) {
     _z_task_t *ptr = *task;
-    z_free(ptr->join_event);
+    // NULL once _z_task_join has already reclaimed it.
+    if (ptr->join_event != NULL) {
+        vEventGroupDelete(ptr->join_event);
+        ptr->join_event = NULL;
+    }
     z_free(ptr);
     *task = NULL;
 }

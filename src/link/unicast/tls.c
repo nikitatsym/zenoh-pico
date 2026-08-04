@@ -28,6 +28,11 @@
 
 #if Z_FEATURE_LINK_TLS == 1
 
+// Zero-progress budget for the exact read. Two leases: the peer is declared dead at one
+// lease anyway, so anything longer than that with no byte at all is a wedge, and the extra
+// lease keeps a merely slow link from losing a message it is still delivering.
+#define _Z_TLS_READ_EXACT_STALL_TIMEOUT_MS (Z_TRANSPORT_LEASE * 2)
+
 uint16_t _z_get_link_mtu_tls(void) { return 65535; }
 
 z_result_t _z_endpoint_tls_valid(_z_endpoint_t *endpoint) {
@@ -171,6 +176,7 @@ static size_t _z_f_link_read_exact_tls(const _z_link_t *self, uint8_t *ptr, size
     _ZP_UNUSED(addr);
 
     size_t n = (size_t)0;
+    z_clock_t stall_start = z_clock_now();
     do {
         size_t rb;
         if (socket != NULL && socket->_tls_sock != NULL) {
@@ -186,7 +192,19 @@ static size_t _z_f_link_read_exact_tls(const _z_link_t *self, uint8_t *ptr, size
             // deadline, busy-looping on the dead connection.
             break;
         }
-        n += rb;
+        if (rb == (size_t)0) {
+            // A would-block is reported as zero, so a peer that stops mid-message keeps
+            // this loop spinning and the caller never gets back to its own deadline. Any
+            // progress rearms the budget, which is why it can stay well past one lease:
+            // it separates a wedged link from a slow one, not a fast link from a slow one.
+            if (z_clock_elapsed_ms(&stall_start) > _Z_TLS_READ_EXACT_STALL_TIMEOUT_MS) {
+                _Z_ERROR("TLS read stalled for %d ms with %zu/%zu bytes", _Z_TLS_READ_EXACT_STALL_TIMEOUT_MS, n, len);
+                break;
+            }
+        } else {
+            stall_start = z_clock_now();
+            n += rb;
+        }
     } while (n != len);
 
     return n;

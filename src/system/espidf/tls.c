@@ -49,6 +49,12 @@
 
 #define Z_TLS_BASE64_MAX_VALUE_LEN (64 * 1024)
 
+// WANT_READ/WANT_WRITE only means the 100 ms socket timeout expired, so the handshake loop
+// spins for as long as the peer stays silent. A full mbed TLS exchange over a hotspot needs
+// seconds, not more; past this the path is black-holed and the open must give the caller
+// back its task.
+#define _Z_ESPIDF_TLS_HANDSHAKE_TIMEOUT_MS 15000
+
 #ifdef ZENOH_LOG_TRACE
 static void _z_tls_debug(void *ctx, int level, const char *file, int line, const char *str) {
     _ZP_UNUSED(ctx);
@@ -459,9 +465,16 @@ z_result_t _z_open_tls(_z_tls_socket_t *sock, const _z_sys_net_endpoint_t *rep, 
 
     mbedtls_ssl_set_bio(&sock->_tls_ctx->_ssl, &sock->_sock._fd, _z_tls_bio_send, _z_tls_bio_recv, NULL);
 
+    z_clock_t handshake_start = z_clock_now();
     while ((mbedret = mbedtls_ssl_handshake(&sock->_tls_ctx->_ssl)) != 0) {
         if (mbedret != MBEDTLS_ERR_SSL_WANT_READ && mbedret != MBEDTLS_ERR_SSL_WANT_WRITE) {
             _Z_ERROR("TLS handshake failed: -0x%04x", -mbedret);
+            _z_close_tcp(&sock->_sock);
+            _z_tls_context_free(&sock->_tls_ctx);
+            return _Z_ERR_GENERIC;
+        }
+        if (z_clock_elapsed_ms(&handshake_start) > _Z_ESPIDF_TLS_HANDSHAKE_TIMEOUT_MS) {
+            _Z_ERROR("TLS handshake timed out after %d ms", _Z_ESPIDF_TLS_HANDSHAKE_TIMEOUT_MS);
             _z_close_tcp(&sock->_sock);
             _z_tls_context_free(&sock->_tls_ctx);
             return _Z_ERR_GENERIC;
