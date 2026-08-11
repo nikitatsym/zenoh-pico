@@ -217,6 +217,10 @@ z_result_t _z_create_endpoint_tcp(_z_sys_net_endpoint_t *ep, const char *s_addre
 void _z_free_endpoint_tcp(_z_sys_net_endpoint_t *ep) { freeaddrinfo(ep->_iptcp); }
 
 /*------------------ TCP sockets ------------------*/
+// A send stalled past this window means a dead path: a blocking send would park
+// the caller forever, above any watchdog. Mirrors the espidf port.
+#define _Z_UNIX_TCP_SEND_TIMEOUT_MS 10000
+
 z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t rep, uint32_t tout) {
     z_result_t ret = _Z_RES_OK;
     sock->_fd = socket(rep._iptcp->ai_family, rep._iptcp->ai_socktype, rep._iptcp->ai_protocol);
@@ -225,6 +229,13 @@ z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t re
         tv.tv_sec = (time_t)(tout / (uint32_t)1000);
         tv.tv_usec = (suseconds_t)((tout % (uint32_t)1000) * (uint32_t)1000);
         if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) < 0)) {
+            _Z_ERROR_LOG(_Z_ERR_GENERIC);
+            ret = _Z_ERR_GENERIC;
+        }
+
+        tv.tv_sec = (time_t)(_Z_UNIX_TCP_SEND_TIMEOUT_MS / (uint32_t)1000);
+        tv.tv_usec = (suseconds_t)((_Z_UNIX_TCP_SEND_TIMEOUT_MS % (uint32_t)1000) * (uint32_t)1000);
+        if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv)) < 0)) {
             _Z_ERROR_LOG(_Z_ERR_GENERIC);
             ret = _Z_ERR_GENERIC;
         }
